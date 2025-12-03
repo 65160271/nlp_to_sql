@@ -1,0 +1,87 @@
+CREATE TABLE product (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT
+                                    NOT NULL,
+    product_code            TEXT    NOT NULL,
+    product_name            TEXT    NOT NULL,
+    generic_name            TEXT,
+    standard_cost           NUMERIC NOT NULL,
+    storage_location        TEXT,
+    stock_min               INTEGER NOT NULL,
+    stock_max               INTEGER NOT NULL,
+    packing_size            TEXT,
+    reg_no                  TEXT,
+    indications             TEXT,
+    warnings                TEXT,
+    purchase_notes          TEXT,
+    cost_notes              TEXT,
+    sales_alert_message     TEXT,
+    generic_group           TEXT,
+    wholesale_control_group TEXT,
+    barcode                 TEXT,
+    isactive                BOOLEAN NOT NULL
+                                    DEFAULT (1),
+    manufacturerId          INTEGER,
+    distributorId           INTEGER,
+    productGroupId          INTEGER,
+    base_unit               TEXT,
+    manufactureDate         DATE,
+    expirationDate          DATE,
+    CONSTRAINT UQ_fb912a8e66bfe036057ba4651fe UNIQUE (
+        product_code
+    ),
+    CONSTRAINT FK_da883f8d02581a40e6059bd7b38 FOREIGN KEY (
+        manufacturerId
+    )
+    REFERENCES supplier (id) ON DELETE CASCADE
+                             ON UPDATE NO ACTION,
+    CONSTRAINT FK_396d818ad5658698f4ca2e95235 FOREIGN KEY (
+        distributorId
+    )
+    REFERENCES supplier (id) ON DELETE CASCADE
+                             ON UPDATE NO ACTION,
+    CONSTRAINT FK_2796e33ca2b35e524cf44c891d7 FOREIGN KEY (
+        productGroupId
+    )
+    REFERENCES product_group (id) ON DELETE CASCADE
+                                  ON UPDATE NO ACTION
+);
+REATE TABLE user (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT
+                                     NOT NULL,
+    name                     TEXT    NOT NULL,
+    password                 TEXT    NOT NULL,
+    tel                      TEXT    NOT NULL,
+    role                     TEXT    NOT NULL,
+    hour_work                INTEGER NOT NULL
+                                     DEFAULT (0),
+    sick_leave               INTEGER NOT NULL
+                                     DEFAULT (0),
+    personal_leave           INTEGER NOT NULL
+                                     DEFAULT (0),
+    image                    TEXT    NOT NULL,
+    branchId                 INTEGER,
+    day_off                  TEXT,
+    email                    TEXT,
+    sick_leave_remaining     INTEGER NOT NULL
+                                     DEFAULT (0),
+    personal_leave_remaining INTEGER NOT NULL
+                                     DEFAULT (0),
+    annual_leave             INTEGER NOT NULL
+                                     DEFAULT (0),
+    annual_leave_remaining   INTEGER NOT NULL
+                                     DEFAULT (0),
+    CONSTRAINT FK_8b17d5d91bf27d0a33fb80ade8f FOREIGN KEY (
+        branchId
+    )
+    REFERENCES branch (id) ON DELETE CASCADE
+                           ON UPDATE NO ACTION
+);
+CREATE TABLE branch (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT
+                          NOT NULL,
+    name          TEXT    NOT NULL,
+    address       TEXT    NOT NULL,
+    contact_name  TEXT    NOT NULL
+                          DEFAULT (''),
+    contact_phone TEXT
+);

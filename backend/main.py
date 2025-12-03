@@ -2,17 +2,22 @@
 FastAPI Backend for Natural Language to SQL Converter
 ======================================================
 This backend receives user questions along with database schema and dialect,
-then uses an LLM to generate SQL queries without executing them.
+then uses SQLCoder (open-source text-to-SQL model) to generate SQL queries.
+Supports automatic schema extraction from SQLite, PostgreSQL, and MySQL databases.
 """
 
 import os
+import re
 from typing import List, Literal, Optional
+from urllib.parse import urlparse
 
-import google.generativeai as genai
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import SQLAlchemyError
 
 # Load environment variables from .env file
 load_dotenv()
@@ -20,8 +25,8 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(
     title="NL2SQL API",
-    description="Convert natural language questions to SQL queries",
-    version="1.0.0",
+    description="Convert natural language questions to SQL queries using SQLCoder",
+    version="2.0.0",
 )
 
 # Configure CORS for Vue dev server
@@ -38,17 +43,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Gemini client
-# Set your API key via environment variable: GEMINI_API_KEY
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("WARNING: GEMINI_API_KEY environment variable is not set!")
-    print("Get your API key from: https://aistudio.google.com/apikey")
-else:
-    print(f"Gemini API key loaded (starts with: {GEMINI_API_KEY[:10]}...)")
+# SQLCoder configuration via Ollama
+# Default to localhost:11434 (Ollama default port)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+SQLCODER_MODEL = os.getenv("SQLCODER_MODEL", "gemma:7b")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-flash")
+print(f"Using Ollama at: {OLLAMA_BASE_URL}")
+print(f"SQLCoder model: {SQLCODER_MODEL}")
 
 # ---------------------------------------------------------
 # Pydantic Models
@@ -81,115 +82,241 @@ class ChatResponse(BaseModel):
     sql: str = Field(..., description="The generated SQL query or error message")
 
 
+class DatabaseConnectionRequest(BaseModel):
+    """Request body for database connection."""
+    connection_string: str = Field(
+        ..., description="Database connection string (e.g., sqlite:///path/to/db.sqlite, postgresql://user:pass@host:port/dbname, mysql://user:pass@host:port/dbname)"
+    )
+
+
+class DatabaseConnectionResponse(BaseModel):
+    """Response body for database connection."""
+    success: bool
+    dialect: str
+    schema_text: str
+    tables: List[str]
+    message: str
+
+
+class TestConnectionRequest(BaseModel):
+    """Request body for testing database connection."""
+    connection_string: str
+
+
+class TestConnectionResponse(BaseModel):
+    """Response body for testing database connection."""
+    success: bool
+    dialect: str
+    tables_count: int
+    message: str
+
+
 # ---------------------------------------------------------
-# System Prompt for the LLM
+# SQLCoder Prompt Template
 # ---------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an expert SQL query generator used inside a chat-style web application.
-
-The application works like this:
-- On the frontend (similar to a ChatGPT interface), the user uploads or pastes their database schema (as SQL DDL or a textual description of tables and columns) and then asks questions in natural language.
-- On the backend, a server (FastAPI in Python) sends you:
-  1) The database dialect being used (for example: PostgreSQL, MySQL, SQLite, SQL Server).
-  2) The full database schema, as provided by the user.
-  3) The user's latest question in natural language (which may be in English, Thai, or another language).
-  4) Optionally, some previous chat messages.
+SQLCODER_PROMPT_TEMPLATE = """You are an expert SQL query generator used inside a chat-style web application.
 
 Your single and only responsibility:
 - Convert the user's natural-language question into EXACTLY ONE SQL query string.
-- The output must be a valid SQL SELECT query for the given database dialect, based strictly on the provided schema.
+- The output must be a valid SQL SELECT query for the given database dialect ({dialect}), based strictly on the provided schema.
 
-You must follow these rules carefully:
+Rules:
+1. Dialect: {dialect}. Use syntax specific to this dialect.
+2. Schema: Use ONLY the provided schema below. Do not invent tables.
+3. Output: Return ONLY the SQL query. NO explanations. NO markdown.
+4. Read-only: No INSERT/UPDATE/DELETE.
 
-1. Dialect awareness
-   - You will receive the database dialect in plain text, such as:
-     - "PostgreSQL"
-     - "MySQL"
-     - "SQLite"
-     - "SQL Server"
-   - You MUST generate SQL that is valid for that specific dialect.
-   - Use appropriate syntax and functions for that dialect, especially for:
-     - Date/time operations
-     - String manipulation
-     - Pagination and limiting results
+### Schema
+{schema}
 
-2. Use ONLY the provided schema
-   - You will be given the schema inside a <SCHEMA> ... </SCHEMA> block.
-   - The schema may be:
-     - Raw CREATE TABLE statements (SQL DDL), or
-     - A structured description of tables, columns, data types, and relationships.
-   - You MUST NOT:
-     - Invent new tables.
-     - Invent new columns.
-     - Assume the existence of fields that are not present in the schema.
-   - If the user's question refers to data that is not available in the schema, you may not fabricate structure.
+### Question
+{question}
 
-3. Output format
-   - Return ONLY the SQL query text.
-   - Do NOT include any explanations.
-   - Do NOT include natural-language comments.
-   - Do NOT wrap the query in backticks or markdown code fences.
-   - A trailing semicolon at the end is allowed but not required.
-   - There must be exactly one query (no multiple statements).
-
-4. Read-only restriction
-   - Only read-only analytical queries are allowed.
-   - You MUST NOT generate queries that modify or delete data:
-     - No INSERT, UPDATE, DELETE, MERGE, DROP, ALTER, TRUNCATE, CREATE, or any DDL/DML that changes the database.
-   - If the user explicitly asks for write operations or schema changes, you must NOT generate such a query.
-   - Instead, return a single line:
-     -- ERROR: Write operations (INSERT/UPDATE/DELETE/DDL) are not allowed. Only SELECT queries are permitted.
-
-5. Handling impossible or incompatible requests
-   - If the question absolutely cannot be answered using the provided schema (e.g. the referenced table or column does not exist in <SCHEMA>), then:
-     - Return a single-line SQL comment starting with:
-       -- ERROR:
-     - For example:
-       -- ERROR: The question refers to tables or columns that do not exist in the provided schema.
-
-6. Joins and relationships
-   - If the schema indicates foreign keys or common naming conventions (e.g. user_id, customer_id), use sensible JOINs.
-   - Use explicit JOIN syntax (e.g. INNER JOIN, LEFT JOIN) with ON clauses.
-   - Use clear table aliases when helpful.
-
-7. Aggregations and grouping
-   - If the user asks for totals, counts, averages, minimum, maximum, or similar aggregations:
-     - Use the appropriate aggregate functions (COUNT, SUM, AVG, MIN, MAX, etc.).
-     - Include a proper GROUP BY clause when needed.
-
-8. Time ranges and natural language
-   - When the user mentions "today", "yesterday", "last week", "last month", "this year", etc., convert those into date filters using:
-     - The correct "current time" function and date manipulation functions for the specified dialect.
-   - You may interpret:
-     - "last month" as the full previous calendar month.
-     - "last week" as the previous 7 days or previous calendar week, using a reasonable convention as long as it is consistent.
-
-9. Language of the question
-   - The user's question may be in English, Thai, or other languages.
-   - You ONLY need to understand it well enough to generate the correct SQL.
-   - Your output must always be SQL-only, never a natural language explanation.
-
-Summary:
-- Your response must be EXACTLY ONE of the following:
-  1) A single valid SQL SELECT query, OR
-  2) A single-line SQL comment starting with `-- ERROR:` describing why the query cannot be generated.
-
-Follow these instructions strictly."""
-
-
-def build_user_prompt(dialect: str, schema_text: str, message: str) -> str:
-    """
-    Build the user prompt that includes dialect, schema, and the question.
-    """
-    return f"""Database dialect: {dialect}
-
-<SCHEMA>
-{schema_text}
-</SCHEMA>
-
-User question:
-"{message}"
+### SQL Query
 """
+
+
+# แก้ไขฟังก์ชัน build_sqlcoder_prompt (ประมาณบรรทัด 142)
+def build_sqlcoder_prompt(schema_text: str, question: str, dialect: str) -> str:
+    """
+    Build the prompt for DeepSeek model.
+    """
+    # ไม่ต้องเอา dialect ไปรวมกับ schema แล้ว เพราะใน Template เราแยกที่วางไว้ให้แล้ว
+    return SQLCODER_PROMPT_TEMPLATE.format(
+        question=question,
+        schema=schema_text,
+        dialect=dialect  # ส่ง dialect เข้าไปตรงๆ
+    )
+
+
+async def generate_sql_with_sqlcoder(prompt: str) -> str:
+    """
+    Generate SQL using SQLCoder via Ollama.
+    """
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            response = await client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": SQLCODER_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.0,
+                        "num_predict": 500,
+                        "stop": ["[/SQL]", "###", "\n\n\n"]
+                    }
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result.get("response", "").strip()
+        except httpx.ConnectError:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. Make sure Ollama is running with SQLCoder model."
+            )
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Ollama error: {str(e)}"
+            )
+
+
+def clean_sql_response(response: str) -> str:
+    """
+    Clean the SQL response from DeepSeek-R1.
+    """
+    # [สำคัญ] 1. ลบส่วนที่โมเดลกำลัง "คิด" (<think>...</think>) ออกไปให้หมด
+    # flags=re.DOTALL จำเป็นมาก เพื่อให้ครอบคลุมข้อความหลายบรรทัด
+    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+
+    # 2. ลบ SQL tags (โค้ดเดิม)
+    response = re.sub(r'\[/?SQL\]', '', response)
+    
+    # 3. ลบ Markdown code blocks (โค้ดเดิม)
+    if "```" in response:
+        # ใช้ Pattern นี้จะแม่นยำกว่าการ split
+        match = re.search(r'```(?:sql)?\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
+        if match:
+            response = match.group(1)
+        else:
+            # Fallback วิธีเดิมถ้าหา pattern ไม่เจอ
+            if response.startswith("```"):
+                lines = response.split("\n")
+                lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                response = "\n".join(lines)
+
+    return response.strip()
+    # Remove any trailing explanations (everything after the first semicolon followed by text)
+    if ";" in response:
+        parts = response.split(";")
+        # Keep only the SQL part
+        sql_parts = []
+        for i, part in enumerate(parts):
+            sql_parts.append(part)
+            # Check if this looks like end of SQL
+            if i < len(parts) - 1:
+                next_part = parts[i + 1].strip()
+                # If next part starts with a lowercase word (explanation), stop
+                if next_part and next_part[0].islower() and not any(kw in next_part.upper()[:20] for kw in ['SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE']):
+                    break
+        response = ";".join(sql_parts)
+        if not response.endswith(";"):
+            response += ";"
+    
+    return response
+
+
+# ---------------------------------------------------------
+# Database Schema Extraction
+# ---------------------------------------------------------
+
+def detect_dialect_from_connection_string(connection_string: str) -> str:
+    """
+    Detect SQL dialect from connection string.
+    """
+    conn_lower = connection_string.lower()
+    if conn_lower.startswith("sqlite"):
+        return "SQLite"
+    elif conn_lower.startswith("postgresql") or conn_lower.startswith("postgres"):
+        return "PostgreSQL"
+    elif conn_lower.startswith("mysql"):
+        return "MySQL"
+    elif conn_lower.startswith("mssql") or "sql server" in conn_lower:
+        return "SQL Server"
+    else:
+        return "Unknown"
+
+
+def extract_schema_from_database(connection_string: str) -> tuple[str, List[str], str]:
+    """
+    Extract schema from a database using SQLAlchemy.
+    Returns (schema_ddl, table_names, dialect).
+    """
+    try:
+        engine = create_engine(connection_string)
+        inspector = inspect(engine)
+        
+        # Detect dialect
+        dialect_name = engine.dialect.name
+        if dialect_name == "sqlite":
+            dialect = "SQLite"
+        elif dialect_name == "postgresql":
+            dialect = "PostgreSQL"
+        elif dialect_name == "mysql":
+            dialect = "MySQL"
+        elif dialect_name == "mssql":
+            dialect = "SQL Server"
+        else:
+            dialect = dialect_name.title()
+        
+        schema_parts = []
+        table_names = inspector.get_table_names()
+        
+        for table_name in table_names:
+            # Get columns
+            columns = inspector.get_columns(table_name)
+            pk_constraint = inspector.get_pk_constraint(table_name)
+            pk_columns = pk_constraint.get("constrained_columns", []) if pk_constraint else []
+            foreign_keys = inspector.get_foreign_keys(table_name)
+            
+            # Build CREATE TABLE statement
+            column_defs = []
+            for col in columns:
+                col_def = f"  {col['name']} {col['type']}"
+                if not col.get("nullable", True):
+                    col_def += " NOT NULL"
+                if col.get("default") is not None:
+                    col_def += f" DEFAULT {col['default']}"
+                if col["name"] in pk_columns and len(pk_columns) == 1:
+                    col_def += " PRIMARY KEY"
+                column_defs.append(col_def)
+            
+            # Add composite primary key if exists
+            if len(pk_columns) > 1:
+                column_defs.append(f"  PRIMARY KEY ({', '.join(pk_columns)})")
+            
+            # Add foreign keys
+            for fk in foreign_keys:
+                fk_cols = ", ".join(fk["constrained_columns"])
+                ref_table = fk["referred_table"]
+                ref_cols = ", ".join(fk["referred_columns"])
+                column_defs.append(f"  FOREIGN KEY ({fk_cols}) REFERENCES {ref_table}({ref_cols})")
+            
+            create_stmt = f"CREATE TABLE {table_name} (\n" + ",\n".join(column_defs) + "\n);"
+            schema_parts.append(create_stmt)
+        
+        schema_ddl = "\n\n".join(schema_parts)
+        
+        engine.dispose()
+        return schema_ddl, table_names, dialect
+        
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=400, detail=f"Database connection error: {str(e)}")
 
 
 # ---------------------------------------------------------
@@ -199,13 +326,45 @@ User question:
 @app.get("/")
 async def root():
     """Health check endpoint."""
-    return {"status": "ok", "message": "NL2SQL API is running"}
+    return {
+        "status": "ok",
+        "message": "NL2SQL API is running",
+        "model": "SQLCoder (via Ollama)",
+        "ollama_url": OLLAMA_BASE_URL
+    }
+
+
+@app.get("/api/health")
+async def health_check():
+    """Check if Ollama and SQLCoder are available."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            response.raise_for_status()
+            models = response.json().get("models", [])
+            model_names = [m.get("name", "").split(":")[0] for m in models]
+            
+            sqlcoder_available = any(SQLCODER_MODEL in name for name in model_names)
+            
+            return {
+                "ollama_available": True,
+                "sqlcoder_available": sqlcoder_available,
+                "available_models": model_names,
+                "configured_model": SQLCODER_MODEL
+            }
+    except Exception as e:
+        return {
+            "ollama_available": False,
+            "sqlcoder_available": False,
+            "error": str(e),
+            "configured_model": SQLCODER_MODEL
+        }
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """
-    Generate SQL from a natural language question.
+    Generate SQL from a natural language question using SQLCoder.
     
     This endpoint receives:
     - dialect: The SQL dialect (PostgreSQL, MySQL, SQLite, SQL Server)
@@ -223,55 +382,147 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     
     try:
-        # Build the full prompt with system instructions and history
-        full_prompt = SYSTEM_PROMPT + "\n\n"
-        
-        # Add chat history if provided (limit to last 10 messages for context)
+        # Build the SQLCoder prompt
+        # Include context from history if available
+        context = ""
         if request.history:
-            for msg in request.history[-10:]:
-                role_label = "User" if msg.role == "user" else "Assistant"
-                full_prompt += f"{role_label}: {msg.content}\n\n"
+            for msg in request.history[-4:]:  # Last 4 messages for context
+                if msg.role == "user":
+                    context += f"Previous question: {msg.content}\n"
+                else:
+                    context += f"Previous SQL: {msg.content}\n"
         
-        # Add the current user prompt
-        user_prompt = build_user_prompt(
-            dialect=request.dialect,
+        question = request.message
+        if context:
+            question = f"{context}\nCurrent question: {request.message}"
+        
+        prompt = build_sqlcoder_prompt(
             schema_text=request.schema_text,
-            message=request.message
-        )
-        full_prompt += f"User: {user_prompt}"
-        
-        # Call Gemini with low temperature for deterministic output
-        generation_config = genai.types.GenerationConfig(
-            temperature=0.1,
-            max_output_tokens=2000,
-        )
-        response = model.generate_content(
-            full_prompt,
-            generation_config=generation_config,
+            question=question,
+            dialect=request.dialect
         )
         
-        # Extract and clean the response
-        sql_response = response.text.strip()
+        # Generate SQL using SQLCoder
+        raw_response = await generate_sql_with_sqlcoder(prompt)
         
-        # Remove any markdown code fences if the model added them despite instructions
-        if sql_response.startswith("```"):
-            lines = sql_response.split("\n")
-            # Remove first line (```sql or ```)
-            lines = lines[1:]
-            # Remove last line if it's closing fence
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            sql_response = "\n".join(lines).strip()
+        # Clean the response
+        sql_response = clean_sql_response(raw_response)
+        
+        # Validate it's a SELECT query (read-only)
+        sql_upper = sql_response.upper().strip()
+        write_keywords = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "MERGE"]
+        
+        if any(sql_upper.startswith(kw) for kw in write_keywords):
+            return ChatResponse(
+                sql="-- ERROR: Write operations (INSERT/UPDATE/DELETE/DDL) are not allowed. Only SELECT queries are permitted."
+            )
+        
+        if not sql_response or sql_response.isspace():
+            return ChatResponse(
+                sql="-- ERROR: Could not generate SQL for this question. Please try rephrasing."
+            )
         
         return ChatResponse(sql=sql_response)
     
+    except HTTPException:
+        raise
     except Exception as e:
-        # Return a user-friendly error message
         error_message = f"-- ERROR: Failed to generate SQL. {str(e)}"
         return ChatResponse(sql=error_message)
+
+
+@app.post("/api/connect", response_model=DatabaseConnectionResponse)
+async def connect_database(request: DatabaseConnectionRequest) -> DatabaseConnectionResponse:
+    """
+    Connect to a database and extract its schema.
+    
+    Supports:
+    - SQLite: sqlite:///path/to/database.db
+    - PostgreSQL: postgresql://user:password@host:port/dbname
+    - MySQL: mysql://user:password@host:port/dbname
+    """
+    try:
+        schema_ddl, table_names, dialect = extract_schema_from_database(request.connection_string)
+        
+        if not table_names:
+            return DatabaseConnectionResponse(
+                success=True,
+                dialect=dialect,
+                schema_text="",
+                tables=[],
+                message="Connected successfully, but no tables found in the database."
+            )
+        
+        return DatabaseConnectionResponse(
+            success=True,
+            dialect=dialect,
+            schema_text=schema_ddl,
+            tables=table_names,
+            message=f"Successfully connected to {dialect} database. Found {len(table_names)} table(s)."
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        return DatabaseConnectionResponse(
+            success=False,
+            dialect="Unknown",
+            schema_text="",
+            tables=[],
+            message=f"Failed to connect: {str(e)}"
+        )
+
+
+@app.post("/api/test-connection", response_model=TestConnectionResponse)
+async def test_connection(request: TestConnectionRequest) -> TestConnectionResponse:
+    """
+    Test database connection without extracting full schema.
+    """
+    try:
+        engine = create_engine(request.connection_string)
+        
+        # Try to connect
+        with engine.connect() as conn:
+            # Simple query to test connection
+            if engine.dialect.name == "sqlite":
+                result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+            elif engine.dialect.name == "postgresql":
+                result = conn.execute(text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'"))
+            elif engine.dialect.name == "mysql":
+                result = conn.execute(text("SHOW TABLES"))
+            else:
+                result = conn.execute(text("SELECT 1"))
+            
+            tables = list(result)
+        
+        dialect_name = engine.dialect.name
+        if dialect_name == "sqlite":
+            dialect = "SQLite"
+        elif dialect_name == "postgresql":
+            dialect = "PostgreSQL"
+        elif dialect_name == "mysql":
+            dialect = "MySQL"
+        else:
+            dialect = dialect_name.title()
+        
+        engine.dispose()
+        
+        return TestConnectionResponse(
+            success=True,
+            dialect=dialect,
+            tables_count=len(tables),
+            message=f"Successfully connected to {dialect} database with {len(tables)} table(s)."
+        )
+    
+    except Exception as e:
+        return TestConnectionResponse(
+            success=False,
+            dialect="Unknown",
+            tables_count=0,
+            message=f"Connection failed: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

@@ -23,6 +23,29 @@ interface ChatResponse {
   sql: string
 }
 
+interface DatabaseConnectionResponse {
+  success: boolean
+  dialect: string
+  schema_text: string
+  tables: string[]
+  message: string
+}
+
+interface TestConnectionResponse {
+  success: boolean
+  dialect: string
+  tables_count: number
+  message: string
+}
+
+interface HealthResponse {
+  ollama_available: boolean
+  sqlcoder_available: boolean
+  available_models?: string[]
+  configured_model: string
+  error?: string
+}
+
 // ---------------------------------------------------------
 // Reactive State
 // ---------------------------------------------------------
@@ -32,11 +55,26 @@ const schemaText = ref('')
 const dialect = ref<'PostgreSQL' | 'MySQL' | 'SQLite' | 'SQL Server'>('PostgreSQL')
 const dialects = ['PostgreSQL', 'MySQL', 'SQLite', 'SQL Server'] as const
 
+// Database Connection
+const connectionString = ref('')
+const isConnecting = ref(false)
+const isTesting = ref(false)
+const connectionStatus = ref<'idle' | 'success' | 'error'>('idle')
+const connectionMessage = ref('')
+const connectedTables = ref<string[]>([])
+
 // Chat
 const messages = ref<ChatMessage[]>([])
 const inputText = ref('')
 const isLoading = ref(false)
 const chatContainerRef = ref<HTMLElement | null>(null)
+
+// Model Status
+const modelStatus = ref<HealthResponse | null>(null)
+const isCheckingModel = ref(false)
+
+// Schema Mode
+const schemaMode = ref<'manual' | 'database'>('manual')
 
 // ---------------------------------------------------------
 // Computed Properties
@@ -60,9 +98,39 @@ const statusText = computed(() => {
   return '⚠️ No schema provided yet'
 })
 
+const connectionPlaceholder = computed(() => {
+  const examples = {
+    SQLite: 'sqlite:///path/to/database.db',
+    PostgreSQL: 'postgresql://user:password@localhost:5432/dbname',
+    MySQL: 'mysql://user:password@localhost:3306/dbname',
+    'SQL Server': 'mssql+pyodbc://user:password@host/dbname?driver=ODBC+Driver+17+for+SQL+Server'
+  }
+  return examples[dialect.value] || 'Enter connection string...'
+})
+
 // ---------------------------------------------------------
 // Methods
 // ---------------------------------------------------------
+
+/**
+ * Check model health
+ */
+async function checkModelHealth() {
+  isCheckingModel.value = true
+  try {
+    const response = await axios.get<HealthResponse>('/api/health')
+    modelStatus.value = response.data
+  } catch (error) {
+    modelStatus.value = {
+      ollama_available: false,
+      sqlcoder_available: false,
+      configured_model: 'sqlcoder',
+      error: 'Cannot connect to backend'
+    }
+  } finally {
+    isCheckingModel.value = false
+  }
+}
 
 /**
  * Handle file upload for schema
@@ -78,12 +146,107 @@ function handleFileUpload(event: Event) {
     const content = e.target?.result as string
     if (content) {
       schemaText.value = content
+      schemaMode.value = 'manual'
     }
   }
   reader.readAsText(file)
   
   // Reset input so same file can be re-uploaded
   target.value = ''
+}
+
+/**
+ * Test database connection
+ */
+async function testConnection() {
+  if (!connectionString.value.trim()) {
+    connectionStatus.value = 'error'
+    connectionMessage.value = 'Please enter a connection string'
+    return
+  }
+  
+  isTesting.value = true
+  connectionStatus.value = 'idle'
+  connectionMessage.value = ''
+  
+  try {
+    const response = await axios.post<TestConnectionResponse>('/api/test-connection', {
+      connection_string: connectionString.value
+    })
+    
+    if (response.data.success) {
+      connectionStatus.value = 'success'
+      connectionMessage.value = response.data.message
+      // Auto-detect dialect
+      if (response.data.dialect && dialects.includes(response.data.dialect as any)) {
+        dialect.value = response.data.dialect as typeof dialect.value
+      }
+    } else {
+      connectionStatus.value = 'error'
+      connectionMessage.value = response.data.message
+    }
+  } catch (error) {
+    connectionStatus.value = 'error'
+    connectionMessage.value = 'Failed to test connection. Is the backend running?'
+  } finally {
+    isTesting.value = false
+  }
+}
+
+/**
+ * Connect and fetch schema from database
+ */
+async function connectAndFetchSchema() {
+  if (!connectionString.value.trim()) {
+    connectionStatus.value = 'error'
+    connectionMessage.value = 'Please enter a connection string'
+    return
+  }
+  
+  isConnecting.value = true
+  connectionStatus.value = 'idle'
+  connectionMessage.value = ''
+  
+  try {
+    const response = await axios.post<DatabaseConnectionResponse>('/api/connect', {
+      connection_string: connectionString.value
+    })
+    
+    if (response.data.success) {
+      connectionStatus.value = 'success'
+      connectionMessage.value = response.data.message
+      schemaText.value = response.data.schema_text
+      connectedTables.value = response.data.tables
+      schemaMode.value = 'database'
+      
+      // Auto-detect dialect
+      if (response.data.dialect && dialects.includes(response.data.dialect as any)) {
+        dialect.value = response.data.dialect as typeof dialect.value
+      }
+    } else {
+      connectionStatus.value = 'error'
+      connectionMessage.value = response.data.message
+    }
+  } catch (error) {
+    connectionStatus.value = 'error'
+    connectionMessage.value = 'Failed to connect. Check your connection string.'
+  } finally {
+    isConnecting.value = false
+  }
+}
+
+/**
+ * Clear connection
+ */
+function clearConnection() {
+  connectionString.value = ''
+  connectionStatus.value = 'idle'
+  connectionMessage.value = ''
+  connectedTables.value = []
+  if (schemaMode.value === 'database') {
+    schemaText.value = ''
+    schemaMode.value = 'manual'
+  }
 }
 
 /**
@@ -179,13 +342,16 @@ function clearChat() {
   messages.value = []
 }
 
-// Initial welcome message
+// Initial setup
 onMounted(() => {
   messages.value.push({
     role: 'assistant',
-    content: 'Hello! I\'m your SQL assistant. Upload or paste your database schema on the left, then ask me questions in natural language, and I\'ll generate SQL queries for you.',
+    content: 'Hello! I\'m your SQL assistant powered by SQLCoder. Connect to a database or paste your schema on the left, then ask me questions in natural language, and I\'ll generate SQL queries for you.',
     isSql: false
   })
+  
+  // Check model health
+  checkModelHealth()
 })
 </script>
 
@@ -200,11 +366,86 @@ onMounted(() => {
             <path d="M2 8c0 3.31 4.48 6 10 6s10-2.69 10-6" stroke="currentColor" stroke-width="1.5"/>
             <path d="M2 12c0 3.31 4.48 6 10 6s10-2.69 10-6" stroke="currentColor" stroke-width="1.5"/>
           </svg>
-          <span>SQL Chat</span>
+          <span>SQLCoder Chat</span>
         </div>
       </div>
 
       <div class="sidebar-content">
+        <!-- Model Status -->
+        <div class="model-status-card" :class="{ 
+          'status-ok': modelStatus?.sqlcoder_available, 
+          'status-warning': modelStatus && !modelStatus.sqlcoder_available && modelStatus.ollama_available,
+          'status-error': modelStatus && !modelStatus.ollama_available 
+        }">
+          <div class="model-status-header">
+            <span class="status-dot"></span>
+            <span v-if="isCheckingModel">Checking model...</span>
+            <span v-else-if="modelStatus?.sqlcoder_available">SQLCoder Ready</span>
+            <span v-else-if="modelStatus?.ollama_available">Ollama Running (Model Missing)</span>
+            <span v-else>Ollama Not Connected</span>
+          </div>
+          <button class="refresh-btn" @click="checkModelHealth" :disabled="isCheckingModel">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" :class="{ spinning: isCheckingModel }">
+              <path d="M1 4v6h6M23 20v-6h-6M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Database Connection Card -->
+        <div class="db-connection-card">
+          <h3>Database Connection</h3>
+          <p class="card-description">Connect directly to your database to auto-fetch schema</p>
+          
+          <div class="connection-input-wrapper">
+            <input
+              v-model="connectionString"
+              type="text"
+              class="connection-input"
+              :placeholder="connectionPlaceholder"
+              :disabled="isConnecting || isTesting"
+            />
+          </div>
+          
+          <div class="connection-buttons">
+            <button 
+              class="test-btn" 
+              @click="testConnection" 
+              :disabled="isTesting || isConnecting || !connectionString.trim()"
+            >
+              <span v-if="isTesting" class="btn-spinner"></span>
+              <span v-else>Test</span>
+            </button>
+            <button 
+              class="connect-btn" 
+              @click="connectAndFetchSchema" 
+              :disabled="isConnecting || isTesting || !connectionString.trim()"
+            >
+              <span v-if="isConnecting" class="btn-spinner"></span>
+              <span v-else>Connect & Fetch Schema</span>
+            </button>
+          </div>
+          
+          <!-- Connection Status -->
+          <div v-if="connectionStatus !== 'idle'" class="connection-status" :class="connectionStatus">
+            <span class="status-icon">{{ connectionStatus === 'success' ? '✓' : '✗' }}</span>
+            {{ connectionMessage }}
+          </div>
+          
+          <!-- Connected Tables -->
+          <div v-if="connectedTables.length > 0" class="connected-tables">
+            <div class="tables-header">
+              <span>📋 Tables ({{ connectedTables.length }})</span>
+              <button class="clear-connection-btn" @click="clearConnection">Clear</button>
+            </div>
+            <div class="tables-list">
+              <span v-for="table in connectedTables" :key="table" class="table-badge">
+                {{ table }}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Schema Card -->
         <div class="schema-card">
           <h3>Database Schema</h3>
           
@@ -229,7 +470,7 @@ onMounted(() => {
             <textarea
               v-model="schemaText"
               class="schema-textarea"
-              placeholder="Paste your CREATE TABLE statements here...
+              :placeholder="schemaMode === 'database' ? 'Schema will be loaded from database...' : `Paste your CREATE TABLE statements here...
 
 Example:
 CREATE TABLE users (
@@ -244,14 +485,16 @@ CREATE TABLE orders (
   user_id INTEGER REFERENCES users(id),
   total_amount DECIMAL(10,2),
   order_date DATE
-);"
+);`"
               spellcheck="false"
+              :readonly="schemaMode === 'database'"
             ></textarea>
           </div>
           
           <!-- Status -->
           <div class="schema-status" :class="{ loaded: schemaLoaded }">
             {{ statusText }}
+            <span v-if="schemaMode === 'database'" class="schema-source">(from database)</span>
           </div>
         </div>
 
@@ -280,11 +523,20 @@ CREATE TABLE orders (
       <!-- Chat Header -->
       <header class="chat-header">
         <div class="chat-title">
-          <h1>SQL Chat Assistant</h1>
-          <p>Upload schema → Ask in natural language → Get SQL</p>
+          <h1>SQLCoder Assistant</h1>
+          <p>Connect to DB or paste schema → Ask in natural language → Get SQL</p>
         </div>
-        <div class="dialect-badge">
-          {{ dialect }}
+        <div class="header-badges">
+          <div class="model-badge">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z" fill="currentColor"/>
+              <path d="M12 6a6 6 0 1 0 6 6 6 6 0 0 0-6-6zm0 10a4 4 0 1 1 4-4 4 4 0 0 1-4 4z" fill="currentColor"/>
+            </svg>
+            SQLCoder
+          </div>
+          <div class="dialect-badge">
+            {{ dialect }}
+          </div>
         </div>
       </header>
 
@@ -297,7 +549,7 @@ CREATE TABLE orders (
           :class="{ 'user-message': msg.role === 'user' }"
         >
           <div class="message-label">
-            {{ msg.role === 'user' ? 'You' : 'SQL Assistant' }}
+            {{ msg.role === 'user' ? 'You' : 'SQLCoder' }}
           </div>
           <div
             class="message-bubble"
@@ -314,7 +566,7 @@ CREATE TABLE orders (
 
         <!-- Loading indicator -->
         <div v-if="isLoading" class="message-wrapper">
-          <div class="message-label">SQL Assistant</div>
+          <div class="message-label">SQLCoder</div>
           <div class="message-bubble assistant-bubble loading-bubble">
             <div class="loading-dots">
               <span></span>
@@ -372,8 +624,8 @@ CREATE TABLE orders (
    Sidebar
 --------------------------------------------------------- */
 .sidebar {
-  width: 340px;
-  min-width: 340px;
+  width: 380px;
+  min-width: 380px;
   background: var(--bg-sidebar);
   border-right: 1px solid var(--border-color);
   display: flex;
@@ -396,11 +648,256 @@ CREATE TABLE orders (
 
 .sidebar-content {
   flex: 1;
-  padding: 1.5rem;
+  padding: 1.25rem;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 1rem;
+}
+
+/* ---------------------------------------------------------
+   Model Status Card
+--------------------------------------------------------- */
+.model-status-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  background: var(--bg-card);
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  font-size: 0.85rem;
+}
+
+.model-status-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.model-status-card.status-ok .status-dot {
+  background: var(--text-success);
+  box-shadow: 0 0 8px var(--text-success);
+}
+
+.model-status-card.status-warning .status-dot {
+  background: var(--text-warning);
+}
+
+.model-status-card.status-error .status-dot {
+  background: var(--danger-color);
+}
+
+.refresh-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: all 0.2s ease;
+}
+
+.refresh-btn:hover:not(:disabled) {
+  color: var(--accent-primary);
+  background: var(--accent-bg);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.5;
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* ---------------------------------------------------------
+   Database Connection Card
+--------------------------------------------------------- */
+.db-connection-card {
+  background: var(--bg-card);
+  border-radius: 12px;
+  padding: 1.25rem;
+  border: 1px solid var(--border-color);
+}
+
+.db-connection-card h3 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.5rem;
+}
+
+.card-description {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+}
+
+.connection-input-wrapper {
+  margin-bottom: 0.75rem;
+}
+
+.connection-input {
+  width: 100%;
+  padding: 0.75rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  transition: border-color 0.2s ease;
+}
+
+.connection-input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.connection-input::placeholder {
+  color: var(--text-muted);
+}
+
+.connection-buttons {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.test-btn,
+.connect-btn {
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.test-btn {
+  background: var(--bg-hover);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  flex: 0 0 60px;
+}
+
+.test-btn:hover:not(:disabled) {
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+}
+
+.connect-btn {
+  flex: 1;
+  background: var(--accent-primary);
+  border: none;
+  color: white;
+}
+
+.connect-btn:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.test-btn:disabled,
+.connect-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  margin-bottom: 0.75rem;
+}
+
+.connection-status.success {
+  background: var(--success-bg);
+  color: var(--text-success);
+}
+
+.connection-status.error {
+  background: var(--danger-bg);
+  color: var(--danger-color);
+}
+
+.status-icon {
+  font-weight: bold;
+}
+
+.connected-tables {
+  border-top: 1px solid var(--border-color);
+  padding-top: 0.75rem;
+}
+
+.tables-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.clear-connection-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.clear-connection-btn:hover {
+  color: var(--danger-color);
+}
+
+.tables-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.table-badge {
+  padding: 0.25rem 0.6rem;
+  background: var(--accent-bg);
+  color: var(--accent-primary);
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-family: 'JetBrains Mono', monospace;
 }
 
 /* ---------------------------------------------------------
@@ -456,14 +953,14 @@ CREATE TABLE orders (
 
 .schema-textarea {
   width: 100%;
-  height: 280px;
+  height: 200px;
   padding: 0.875rem;
   background: var(--bg-input);
   border: 1px solid var(--border-color);
   border-radius: 8px;
   color: var(--text-primary);
   font-family: 'JetBrains Mono', monospace;
-  font-size: 0.8rem;
+  font-size: 0.75rem;
   line-height: 1.5;
   resize: vertical;
   transition: border-color 0.2s ease;
@@ -478,17 +975,29 @@ CREATE TABLE orders (
   color: var(--text-muted);
 }
 
+.schema-textarea[readonly] {
+  background: var(--bg-code);
+}
+
 .schema-status {
   font-size: 0.8rem;
   color: var(--text-warning);
   padding: 0.5rem 0.75rem;
   background: var(--warning-bg);
   border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .schema-status.loaded {
   color: var(--text-success);
   background: var(--success-bg);
+}
+
+.schema-source {
+  font-size: 0.7rem;
+  opacity: 0.8;
 }
 
 /* ---------------------------------------------------------
@@ -570,6 +1079,23 @@ CREATE TABLE orders (
 .chat-title p {
   font-size: 0.85rem;
   color: var(--text-secondary);
+}
+
+.header-badges {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.model-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 1rem;
+  background: var(--success-bg);
+  color: var(--text-success);
+  border-radius: 20px;
+  font-size: 0.8rem;
+  font-weight: 500;
 }
 
 .dialect-badge {
@@ -840,7 +1366,7 @@ CREATE TABLE orders (
 /* ---------------------------------------------------------
    Responsive
 --------------------------------------------------------- */
-@media (max-width: 900px) {
+@media (max-width: 1000px) {
   .app-container {
     flex-direction: column;
   }
@@ -852,7 +1378,7 @@ CREATE TABLE orders (
   }
   
   .schema-textarea {
-    height: 120px;
+    height: 100px;
   }
   
   .message-wrapper {
@@ -860,4 +1386,3 @@ CREATE TABLE orders (
   }
 }
 </style>
-
