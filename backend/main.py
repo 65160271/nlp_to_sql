@@ -8,7 +8,7 @@ Supports automatic schema extraction from SQLite, PostgreSQL, and MySQL database
 
 import os
 import re
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
+from thefuzz import fuzz
 
 # Load environment variables from .env file
 load_dotenv()
@@ -46,7 +47,7 @@ app.add_middleware(
 # SQLCoder configuration via Ollama
 # Default to localhost:11434 (Ollama default port)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-SQLCODER_MODEL = os.getenv("SQLCODER_MODEL", "gemma:7b")
+SQLCODER_MODEL = os.getenv("SQLCODER_MODEL", "sqlcoder")
 
 print(f"Using Ollama at: {OLLAMA_BASE_URL}")
 print(f"SQLCoder model: {SQLCODER_MODEL}")
@@ -69,11 +70,23 @@ class ChatRequest(BaseModel):
     schema_text: str = Field(
         ..., min_length=1, description="The database schema (CREATE TABLE DDL or description)"
     )
+    table_description: Optional[str] = Field(
+        default="", description="Optional description of the tables and their relationships"
+    )
     message: str = Field(
         ..., min_length=1, description="The user's natural language question"
     )
     history: Optional[List[ChatMessage]] = Field(
         default=[], description="Previous chat messages for context"
+    )
+    enable_value_injection: bool = Field(
+        default=True, description="Enable dynamic value injection to prevent hallucinations"
+    )
+    searchable_columns: Optional[List[str]] = Field(
+        default=None, description="List of table.column pairs to search (e.g., ['employees.first_name', 'departments.name']). If None, searches common text columns."
+    )
+    connection_string: Optional[str] = Field(
+        default=None, description="Database connection string for value injection. Required if enable_value_injection is True."
     )
 
 
@@ -111,42 +124,259 @@ class TestConnectionResponse(BaseModel):
     message: str
 
 
+
+# ---------------------------------------------------------
+# Dynamic Value Injection Functions
+# ---------------------------------------------------------
+
+# Common stop words to filter out from user queries
+STOP_WORDS = {
+    'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+    'should', 'could', 'may', 'might', 'must', 'can', 'shall',
+    'a', 'an', 'and', 'or', 'but', 'if', 'then', 'else', 'when',
+    'at', 'by', 'for', 'with', 'about', 'against', 'between',
+    'into', 'through', 'during', 'before', 'after', 'above',
+    'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off',
+    'over', 'under', 'again', 'further', 'then', 'once',
+    'what', 'which', 'who', 'whom', 'whose', 'where', 'when', 'why', 'how',
+    'show', 'get', 'find', 'list', 'give', 'tell', 'me', 'all', 'any',
+    'select', 'from', 'where', 'order', 'group', 'having', 'limit',
+    'of', 'that', 'this', 'these', 'those', 'i', 'you', 'he', 'she', 'it',
+    'we', 'they', 'them', 'their', 'my', 'your', 'his', 'her', 'its', 'our'
+}
+
+
+def extract_keywords(user_query: str) -> List[str]:
+    """
+    Extract meaningful keywords from user query by removing stop words.
+    
+    Args:
+        user_query: The user's natural language question
+        
+    Returns:
+        List of keywords to search for in the database
+    """
+    # Convert to lowercase and split into words
+    words = re.findall(r'\b\w+\b', user_query.lower())
+    
+    # Filter out stop words and very short words
+    keywords = [w for w in words if w not in STOP_WORDS and len(w) > 2]
+    
+    return keywords
+
+
+def search_column_values(
+    connection_string: str,
+    table_name: str,
+    column_name: str,
+    keywords: List[str],
+    similarity_threshold: int = 70,
+    max_results: int = 5
+) -> List[Tuple[str, int]]:
+    """
+    Search a specific column for values matching keywords using fuzzy matching.
+    
+    Args:
+        connection_string: Database connection string
+        table_name: Name of the table to search
+        column_name: Name of the column to search
+        keywords: List of keywords to search for
+        similarity_threshold: Minimum fuzzy match score (0-100)
+        max_results: Maximum number of results to return
+        
+    Returns:
+        List of (value, confidence_score) tuples
+    """
+    try:
+        engine = create_engine(connection_string)
+        
+        # Build LIKE conditions for initial filtering
+        like_conditions = " OR ".join([f"{column_name} LIKE :keyword{i}" for i in range(len(keywords))])
+        
+        if not like_conditions:
+            return []
+        
+        # Query to get distinct values from the column
+        query = text(f"""
+            SELECT DISTINCT {column_name}
+            FROM {table_name}
+            WHERE {column_name} IS NOT NULL
+            AND ({like_conditions})
+            LIMIT 100
+        """)
+        
+        # Create keyword parameters with wildcards
+        params = {f"keyword{i}": f"%{kw}%" for i, kw in enumerate(keywords)}
+        
+        with engine.connect() as conn:
+            result = conn.execute(query, params)
+            db_values = [row[0] for row in result if row[0]]
+        
+        # Apply fuzzy matching to filter and score results
+        scored_values = []
+        for db_value in db_values:
+            # Calculate best match score across all keywords
+            max_score = 0
+            for keyword in keywords:
+                score = fuzz.partial_ratio(keyword.lower(), str(db_value).lower())
+                max_score = max(max_score, score)
+            
+            if max_score >= similarity_threshold:
+                scored_values.append((str(db_value), max_score))
+        
+        # Sort by confidence score (descending) and return top N
+        scored_values.sort(key=lambda x: x[1], reverse=True)
+        
+        engine.dispose()
+        return scored_values[:max_results]
+        
+    except Exception as e:
+        print(f"Error searching {table_name}.{column_name}: {str(e)}")
+        return []
+
+
+def find_relevant_values(
+    user_query: str,
+    connection_string: str,
+    searchable_columns: Optional[List[str]] = None,
+    similarity_threshold: int = 70
+) -> Dict[str, List[Tuple[str, int]]]:
+    """
+    Find relevant values from the database that match keywords in the user query.
+    
+    Args:
+        user_query: The user's natural language question
+        connection_string: Database connection string
+        searchable_columns: List of 'table.column' pairs to search. If None, searches common text columns.
+        similarity_threshold: Minimum fuzzy match score (0-100)
+        
+    Returns:
+        Dictionary mapping 'table.column' to list of (value, confidence_score) tuples
+    """
+    # Extract keywords from user query
+    keywords = extract_keywords(user_query)
+    
+    if not keywords:
+        return {}
+    
+    # If no searchable columns specified, try to detect text columns
+    if not searchable_columns:
+        try:
+            engine = create_engine(connection_string)
+            inspector = inspect(engine)
+            searchable_columns = []
+            
+            for table_name in inspector.get_table_names():
+                columns = inspector.get_columns(table_name)
+                for col in columns:
+                    # Search text/varchar columns, skip IDs and dates
+                    col_type_str = str(col['type']).upper()
+                    col_name_lower = col['name'].lower()
+                    
+                    if ('VARCHAR' in col_type_str or 'TEXT' in col_type_str or 'CHAR' in col_type_str) and \
+                       not col_name_lower.endswith('_id') and \
+                       'date' not in col_name_lower and \
+                       'time' not in col_name_lower:
+                        searchable_columns.append(f"{table_name}.{col['name']}")
+            
+            engine.dispose()
+        except Exception as e:
+            print(f"Error detecting searchable columns: {str(e)}")
+            return {}
+    
+    # Search each column for matching values
+    matched_values = {}
+    
+    for column_spec in searchable_columns:
+        if '.' not in column_spec:
+            continue
+            
+        table_name, column_name = column_spec.split('.', 1)
+        
+        values = search_column_values(
+            connection_string=connection_string,
+            table_name=table_name,
+            column_name=column_name,
+            keywords=keywords,
+            similarity_threshold=similarity_threshold
+        )
+        
+        if values:
+            matched_values[column_spec] = values
+    
+    return matched_values
+
+
 # ---------------------------------------------------------
 # SQLCoder Prompt Template
 # ---------------------------------------------------------
 
-SQLCODER_PROMPT_TEMPLATE = """You are an expert SQL query generator used inside a chat-style web application.
+SQLCODER_PROMPT_TEMPLATE = """### Task
+Generate a SQL query to answer [QUESTION]{question}[/QUESTION]
 
-Your single and only responsibility:
-- Convert the user's natural-language question into EXACTLY ONE SQL query string.
-- The output must be a valid SQL SELECT query for the given database dialect ({dialect}), based strictly on the provided schema.
-
-Rules:
-1. Dialect: {dialect}. Use syntax specific to this dialect.
-2. Schema: Use ONLY the provided schema below. Do not invent tables.
-3. Output: Return ONLY the SQL query. NO explanations. NO markdown.
-4. Read-only: No INSERT/UPDATE/DELETE.
-
-### Schema
+### Instructions
+1. Use ONLY the column names that exist in the schema below
+2. Do NOT invent or assume column names
+3. Follow the exact table and column names from the schema
+4. Use proper JOIN conditions based on foreign key relationships shown in the schema
+5. If a column doesn't exist in the schema, you cannot use it
+6. Do NOT include example data, sample values, or WHERE clauses with hardcoded temporary data
+7. Generate queries that retrieve actual data from the database, not example results
+8. Do NOT include example data, sample values, or WHERE clauses with hardcoded temporary data
+### Database Schema
+The query will run on a database with the following schema:
 {schema}
-
-### Question
-{question}
-
-### SQL Query
+{table_description}
+### Answer
+Given the database schema, here is the SQL query that answers [QUESTION]{question}[/QUESTION]
+[SQL]
 """
 
 
-# แก้ไขฟังก์ชัน build_sqlcoder_prompt (ประมาณบรรทัด 142)
-def build_sqlcoder_prompt(schema_text: str, question: str, dialect: str) -> str:
+def build_sqlcoder_prompt(
+    schema_text: str, 
+    question: str, 
+    dialect: str, 
+    table_description: str = "",
+    matched_values: Optional[Dict[str, List[Tuple[str, int]]]] = None
+) -> str:
     """
-    Build the prompt for DeepSeek model.
+    Build the prompt for SQLCoder model.
+    
+    Args:
+        schema_text: Database schema DDL
+        question: User's natural language question
+        dialect: SQL dialect
+        table_description: Optional table context
+        matched_values: Optional dict mapping column names to (value, confidence_score) tuples
     """
-    # ไม่ต้องเอา dialect ไปรวมกับ schema แล้ว เพราะใน Template เราแยกที่วางไว้ให้แล้ว
+    # Add dialect hint to the schema
+    schema_with_dialect = f"-- Database dialect: {dialect}\n{schema_text}"
+    
+    # Add table description if provided
+    description_section = ""
+    if table_description and table_description.strip():
+        description_section = f"\n### Table Context\n{table_description.strip()}\n"
+    
+    # Add matched values section if provided
+    matched_values_section = ""
+    if matched_values and any(matched_values.values()):
+        matched_values_section = "\n### Context / Matched Values\n"
+        matched_values_section += "The following actual values from the database match keywords in the user's question.\n"
+        matched_values_section += "USE THESE EXACT VALUES in your query instead of inventing or guessing values:\n\n"
+        
+        for column, values in matched_values.items():
+            if values:
+                matched_values_section += f"**{column}**:\n"
+                for value, confidence in values[:5]:  # Top 5 matches
+                    matched_values_section += f"  - '{value}' (confidence: {confidence}%)\n"
+                matched_values_section += "\n"
+    
     return SQLCODER_PROMPT_TEMPLATE.format(
         question=question,
-        schema=schema_text,
-        dialect=dialect  # ส่ง dialect เข้าไปตรงๆ
+        schema=schema_with_dialect,
+        table_description=description_section + matched_values_section
     )
 
 
@@ -186,31 +416,28 @@ async def generate_sql_with_sqlcoder(prompt: str) -> str:
 
 def clean_sql_response(response: str) -> str:
     """
-    Clean the SQL response from DeepSeek-R1.
+    Clean the SQL response from SQLCoder.
     """
-    # [สำคัญ] 1. ลบส่วนที่โมเดลกำลัง "คิด" (<think>...</think>) ออกไปให้หมด
-    # flags=re.DOTALL จำเป็นมาก เพื่อให้ครอบคลุมข้อความหลายบรรทัด
-    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
-
-    # 2. ลบ SQL tags (โค้ดเดิม)
+    # Remove special tokens like <s>, </s>, <|im_start|>, <|im_end|>, etc.
+    response = re.sub(r'</?s>', '', response)
+    response = re.sub(r'<\|im_start\|>', '', response)
+    response = re.sub(r'<\|im_end\|>', '', response)
+    response = re.sub(r'<\|.*?\|>', '', response)
+    
+    # Remove SQL tags if present
     response = re.sub(r'\[/?SQL\]', '', response)
     
-    # 3. ลบ Markdown code blocks (โค้ดเดิม)
-    if "```" in response:
-        # ใช้ Pattern นี้จะแม่นยำกว่าการ split
-        match = re.search(r'```(?:sql)?\s*(.*?)\s*```', response, re.DOTALL | re.IGNORECASE)
-        if match:
-            response = match.group(1)
-        else:
-            # Fallback วิธีเดิมถ้าหา pattern ไม่เจอ
-            if response.startswith("```"):
-                lines = response.split("\n")
-                lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                response = "\n".join(lines)
-
-    return response.strip()
+    # Remove markdown code fences
+    if response.startswith("```"):
+        lines = response.split("\n")
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        response = "\n".join(lines)
+    
+    # Clean up whitespace
+    response = response.strip()
+    
     # Remove any trailing explanations (everything after the first semicolon followed by text)
     if ";" in response:
         parts = response.split(";")
@@ -396,10 +623,28 @@ async def chat(request: ChatRequest) -> ChatResponse:
         if context:
             question = f"{context}\nCurrent question: {request.message}"
         
+        # Dynamic Value Injection: Find relevant values from database
+        matched_values = None
+        if request.enable_value_injection and request.connection_string:
+            try:
+                matched_values = find_relevant_values(
+                    user_query=request.message,
+                    connection_string=request.connection_string,
+                    searchable_columns=request.searchable_columns,
+                    similarity_threshold=70
+                )
+                print(f"Value injection found {len(matched_values)} matching columns")
+            except Exception as e:
+                # Don't fail the request if value injection fails
+                print(f"Value injection error (continuing without it): {str(e)}")
+                matched_values = None
+        
         prompt = build_sqlcoder_prompt(
             schema_text=request.schema_text,
             question=question,
-            dialect=request.dialect
+            dialect=request.dialect,
+            table_description=request.table_description or "",
+            matched_values=matched_values
         )
         
         # Generate SQL using SQLCoder

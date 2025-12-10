@@ -15,6 +15,7 @@ interface ChatMessage {
 interface ChatRequest {
   dialect: string
   schema_text: string
+  table_description: string
   message: string
   history: { role: string; content: string }[]
 }
@@ -52,6 +53,7 @@ interface HealthResponse {
 
 // Schema & Dialect
 const schemaText = ref('')
+const tableDescription = ref('')
 const dialect = ref<'PostgreSQL' | 'MySQL' | 'SQLite' | 'SQL Server'>('PostgreSQL')
 const dialects = ['PostgreSQL', 'MySQL', 'SQLite', 'SQL Server'] as const
 
@@ -306,6 +308,7 @@ async function sendMessage() {
   const request: ChatRequest = {
     dialect: dialect.value,
     schema_text: schemaText.value,
+    table_description: tableDescription.value,
     message: userMessage,
     history: history.slice(0, -1) // Exclude the message we just added
   }
@@ -406,6 +409,23 @@ onMounted(() => {
             />
           </div>
           
+          <!-- Connection Examples -->
+          <div class="connection-examples">
+            <div class="example-title">Examples:</div>
+            <div class="example-item">
+              <strong>SQLite:</strong> <code>sqlite:///path/to/database.db</code>
+            </div>
+            <div class="example-item">
+              <strong>PostgreSQL:</strong> <code>postgresql://user:password@localhost:5432/dbname</code>
+            </div>
+            <div class="example-item">
+              <strong>MySQL:</strong> <code>mysql://user:password@localhost:3306/dbname</code>
+            </div>
+            <div class="example-item">
+              <strong>SQL Server:</strong> <code>mssql+pyodbc://user:password@host/dbname?driver=ODBC+Driver+17+for+SQL+Server</code>
+            </div>
+          </div>
+          
           <div class="connection-buttons">
             <button 
               class="test-btn" 
@@ -495,6 +515,24 @@ CREATE TABLE orders (
           <div class="schema-status" :class="{ loaded: schemaLoaded }">
             {{ statusText }}
             <span v-if="schemaMode === 'database'" class="schema-source">(from database)</span>
+          </div>
+        </div>
+
+        <!-- Table Description Card -->
+        <div class="schema-card">
+          <h3>Table Description</h3>
+          <p class="card-description">Provide context about your tables to improve query accuracy</p>
+          
+          <div class="schema-textarea-wrapper">
+            <textarea
+              v-model="tableDescription"
+              class="description-textarea"
+              placeholder="Describe your tables, their purpose, and any important relationships...
+
+Example:
+The 'users' table contains customer information. The 'orders' table tracks all customer purchases and links to users via user_id. The 'products' table contains our inventory items."
+              spellcheck="true"
+            ></textarea>
           </div>
         </div>
 
@@ -776,6 +814,42 @@ CREATE TABLE orders (
   color: var(--text-muted);
 }
 
+.connection-examples {
+  margin-bottom: 0.75rem;
+  padding: 0.75rem;
+  background: var(--bg-code);
+  border-radius: 6px;
+  font-size: 0.75rem;
+}
+
+.example-title {
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+}
+
+.example-item {
+  margin-bottom: 0.4rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.example-item:last-child {
+  margin-bottom: 0;
+}
+
+.example-item strong {
+  color: var(--text-primary);
+  font-weight: 600;
+  min-width: 90px;
+  display: inline-block;
+}
+
+.example-item code {
+  font-size: 0.7rem;
+  word-break: break-all;
+}
+
 .connection-buttons {
   display: flex;
   gap: 0.5rem;
@@ -977,6 +1051,30 @@ CREATE TABLE orders (
 
 .schema-textarea[readonly] {
   background: var(--bg-code);
+}
+
+.description-textarea {
+  width: 100%;
+  height: 120px;
+  padding: 0.875rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  resize: vertical;
+  transition: border-color 0.2s ease;
+}
+
+.description-textarea:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+.description-textarea::placeholder {
+  color: var(--text-muted);
 }
 
 .schema-status {
