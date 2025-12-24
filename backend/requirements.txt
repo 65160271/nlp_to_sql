@@ -16,6 +16,7 @@ python-dotenv>=1.0.0
 # HTTP client for Ollama API calls
 httpx>=0.25.0
 requests>=2.31.0
+ollama>=0.6.0
 
 # SQLAlchemy for multi-database support
 sqlalchemy>=2.0.0

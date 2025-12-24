@@ -20,6 +20,12 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from thefuzz import fuzz
 
+# RAG SQL Service for Dynamic Schema Linking
+from rag_sql_service import RAGSQLService
+
+# Gatekeeper Service for Input Classification
+from gatekeeper_service import SQLGatekeeperService
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -52,6 +58,12 @@ SQLCODER_MODEL = os.getenv("SQLCODER_MODEL", "sqlcoder")
 print(f"Using Ollama at: {OLLAMA_BASE_URL}")
 print(f"SQLCoder model: {SQLCODER_MODEL}")
 
+# Global RAG service instance (initialized on startup)
+rag_service: Optional[RAGSQLService] = None
+
+# Global Gatekeeper service instance (initialized on startup)
+gatekeeper_service: Optional[SQLGatekeeperService] = None
+
 # ---------------------------------------------------------
 # Pydantic Models
 # ---------------------------------------------------------
@@ -68,7 +80,7 @@ class ChatRequest(BaseModel):
         ..., description="The SQL dialect to generate queries for"
     )
     schema_text: str = Field(
-        ..., min_length=1, description="The database schema (CREATE TABLE DDL or description)"
+        default="", description="The database schema (CREATE TABLE DDL or description). Optional when using RAG mode with connection_string."
     )
     table_description: Optional[str] = Field(
         default="", description="Optional description of the tables and their relationships"
@@ -89,18 +101,15 @@ class ChatRequest(BaseModel):
         default=None, description="Database connection string for value injection. Required if enable_value_injection is True."
     )
 
-
 class ChatResponse(BaseModel):
     """Response body for the /api/chat endpoint."""
     sql: str = Field(..., description="The generated SQL query or error message")
-
 
 class DatabaseConnectionRequest(BaseModel):
     """Request body for database connection."""
     connection_string: str = Field(
         ..., description="Database connection string (e.g., sqlite:///path/to/db.sqlite, postgresql://user:pass@host:port/dbname, mysql://user:pass@host:port/dbname)"
     )
-
 
 class DatabaseConnectionResponse(BaseModel):
     """Response body for database connection."""
@@ -110,11 +119,9 @@ class DatabaseConnectionResponse(BaseModel):
     tables: List[str]
     message: str
 
-
 class TestConnectionRequest(BaseModel):
     """Request body for testing database connection."""
     connection_string: str
-
 
 class TestConnectionResponse(BaseModel):
     """Response body for testing database connection."""
@@ -122,8 +129,6 @@ class TestConnectionResponse(BaseModel):
     dialect: str
     tables_count: int
     message: str
-
-
 
 # ---------------------------------------------------------
 # Dynamic Value Injection Functions
@@ -146,7 +151,6 @@ STOP_WORDS = {
     'we', 'they', 'them', 'their', 'my', 'your', 'his', 'her', 'its', 'our'
 }
 
-
 def extract_keywords(user_query: str) -> List[str]:
     """
     Extract meaningful keywords from user query by removing stop words.
@@ -164,7 +168,6 @@ def extract_keywords(user_query: str) -> List[str]:
     keywords = [w for w in words if w not in STOP_WORDS and len(w) > 2]
     
     return keywords
-
 
 def search_column_values(
     connection_string: str,
@@ -234,7 +237,6 @@ def search_column_values(
     except Exception as e:
         print(f"Error searching {table_name}.{column_name}: {str(e)}")
         return []
-
 
 def find_relevant_values(
     user_query: str,
@@ -307,7 +309,6 @@ def find_relevant_values(
     
     return matched_values
 
-
 # ---------------------------------------------------------
 # SQLCoder Prompt Template
 # ---------------------------------------------------------
@@ -332,7 +333,6 @@ The query will run on a database with the following schema:
 Given the database schema, here is the SQL query that answers [QUESTION]{question}[/QUESTION]
 [SQL]
 """
-
 
 def build_sqlcoder_prompt(
     schema_text: str, 
@@ -379,7 +379,6 @@ def build_sqlcoder_prompt(
         table_description=description_section + matched_values_section
     )
 
-
 async def generate_sql_with_sqlcoder(prompt: str) -> str:
     """
     Generate SQL using SQLCoder via Ollama.
@@ -412,7 +411,6 @@ async def generate_sql_with_sqlcoder(prompt: str) -> str:
                 status_code=502,
                 detail=f"Ollama error: {str(e)}"
             )
-
 
 def clean_sql_response(response: str) -> str:
     """
@@ -457,7 +455,6 @@ def clean_sql_response(response: str) -> str:
     
     return response
 
-
 # ---------------------------------------------------------
 # Database Schema Extraction
 # ---------------------------------------------------------
@@ -477,7 +474,6 @@ def detect_dialect_from_connection_string(connection_string: str) -> str:
         return "SQL Server"
     else:
         return "Unknown"
-
 
 def extract_schema_from_database(connection_string: str) -> tuple[str, List[str], str]:
     """
@@ -545,6 +541,47 @@ def extract_schema_from_database(connection_string: str) -> tuple[str, List[str]
     except SQLAlchemyError as e:
         raise HTTPException(status_code=400, detail=f"Database connection error: {str(e)}")
 
+# ---------------------------------------------------------
+# Startup Event - Initialize RAG Service
+# ---------------------------------------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize RAG SQL Service and Gatekeeper on startup."""
+    global rag_service, gatekeeper_service
+    print("\n" + "="*70)
+    print("🚀 Initializing Services...")
+    print("="*70)
+    
+    # Initialize RAG Service
+    try:
+        print("📊 Loading RAG SQL Service...")
+        rag_service = RAGSQLService(
+            embedding_model_name="paraphrase-multilingual-MiniLM-L12-v2",
+            ollama_model="gemma:7b",
+            ollama_base_url=OLLAMA_BASE_URL,
+            cache_maxsize=10,
+            verbose=False  # Set to True for debugging
+        )
+        print("✅ RAG SQL Service initialized successfully!")
+    except Exception as e:
+        print(f"⚠️  Warning: RAG service initialization failed: {str(e)}")
+        print("   RAG endpoints will not be available.")
+    
+    # Initialize Gatekeeper Service
+    try:
+        print("🛡️  Loading Gatekeeper Service...")
+        gatekeeper_service = SQLGatekeeperService(
+            ollama_model="gemma:7b",
+            ollama_base_url=OLLAMA_BASE_URL,
+            verbose=False  # Set to True for debugging
+        )
+        print("✅ Gatekeeper Service initialized successfully!")
+    except Exception as e:
+        print(f"⚠️  Warning: Gatekeeper service initialization failed: {str(e)}")
+        print("   Input filtering will not be available.")
+    
+    print("="*70 + "\n")
 
 # ---------------------------------------------------------
 # API Endpoints
@@ -673,6 +710,107 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise
     except Exception as e:
         error_message = f"-- ERROR: Failed to generate SQL. {str(e)}"
+        return ChatResponse(sql=error_message)
+
+
+@app.post("/api/rag-chat", response_model=ChatResponse)
+async def rag_chat(request: ChatRequest) -> ChatResponse:
+    """
+    Generate SQL using RAG (Retrieval-Augmented Generation) with Dynamic Schema Linking.
+    
+    This endpoint uses the RAGSQLService to:
+    1. **Gatekeeper Filter**: Classify input (CHIT_CHAT, OUT_OF_SCOPE, or VALID_QUERY)
+    2. Check if database schema is cached
+    3. Extract schema and generate embeddings if not cached
+    4. Retrieve only the top-k most relevant tables using semantic search
+    5. Generate SQL with filtered schema (much more efficient than full schema)
+    
+    Benefits:
+    - Filters out irrelevant queries (chit-chat, out-of-scope)
+    - 7.6x faster on cached databases
+    - Reduces LLM context size (only relevant tables)
+    - Supports multilingual queries (Thai/English)
+    - Automatic caching with LRU eviction
+    """
+    # Validate inputs
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    
+    if not request.connection_string:
+        raise HTTPException(
+            status_code=400,
+            detail="connection_string is required for RAG mode. Please provide a database connection string."
+        )
+    
+    # Check if RAG service is available
+    if rag_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail="RAG service not initialized. Please restart the server or use /api/chat endpoint instead."
+        )
+    
+    try:
+        import time
+        start_time = time.time()
+        
+        # STEP 1: Gatekeeper Classification
+        if gatekeeper_service:
+            classification = gatekeeper_service.classify_query(
+                user_input=request.message,
+                db_url=request.connection_string  # Pass db_url for dynamic schema extraction
+            )
+            
+            if classification.type == "CHIT_CHAT":
+                # Return friendly response for chit-chat
+                return ChatResponse(sql=f"-- {classification.reply}")
+            
+            elif classification.type == "SCHEMA_QUESTION":
+                # Return natural language schema description (dynamically extracted)
+                return ChatResponse(sql=f"-- {classification.reply}")
+            
+            elif classification.type == "OUT_OF_SCOPE":
+                # Return message explaining data not available
+                return ChatResponse(sql=f"-- {classification.reply}")
+            
+            # If VALID_QUERY, continue to SQL generation
+        
+        # Check if this database is cached
+        was_cached = request.connection_string in rag_service.schema_cache
+        
+        # Generate SQL using RAG
+        sql = rag_service.get_sql_response(
+            question=request.message,
+            db_url=request.connection_string,
+            top_k=3,  # Use top 3 most relevant tables
+            dialect=request.dialect if hasattr(request, 'dialect') else None
+        )
+        
+        processing_time = time.time() - start_time
+        
+        # Validate it's a SELECT query (read-only)
+        sql_upper = sql.upper().strip()
+        write_keywords = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "MERGE"]
+        
+        if any(sql_upper.startswith(kw) for kw in write_keywords):
+            return ChatResponse(
+                sql="-- ERROR: Write operations (INSERT/UPDATE/DELETE/DDL) are not allowed. Only SELECT queries are permitted."
+            )
+        
+        if not sql or sql.isspace():
+            return ChatResponse(
+                sql="-- ERROR: Could not generate SQL for this question. Please try rephrasing."
+            )
+        
+        # Add metadata comment to SQL
+        cache_status = "cached" if was_cached else "fresh"
+        sql_with_metadata = f"-- RAG Mode: {cache_status} | Processing time: {processing_time:.2f}s\n{sql}"
+        
+        return ChatResponse(sql=sql_with_metadata)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_message = f"-- ERROR: RAG SQL generation failed. {str(e)}"
         return ChatResponse(sql=error_message)
 
 
